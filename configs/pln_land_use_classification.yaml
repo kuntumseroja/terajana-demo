@@ -1,0 +1,139 @@
+# ============================================================================
+# PLN Land Use Classification Config
+# ============================================================================
+# Fine-tune TerraMind for multi-class land use classification
+# around PLN infrastructure corridors in Indonesia.
+#
+# Task: Multi-class segmentation (10 ESA WorldCover classes)
+# Input: Sentinel-2 L2A optical imagery
+# Model: TerraMind v1 Base with TiM (LULC intermediate)
+#
+# Tracks urban expansion, deforestation, and agricultural changes
+# that affect grid planning and right-of-way management.
+#
+# Usage:
+#   terratorch fit -c configs/pln_land_use_classification.yaml
+# ============================================================================
+
+seed_everything: 42
+trainer:
+  accelerator: auto
+  strategy: auto
+  devices: auto
+  num_nodes: 1
+  precision: 16-mixed
+  logger: true
+  callbacks:
+    - class_path: RichProgressBar
+    - class_path: LearningRateMonitor
+      init_args:
+        logging_interval: epoch
+    - class_path: ModelCheckpoint
+      init_args:
+        monitor: val/loss
+        mode: min
+        save_top_k: 3
+        filename: "pln-lulc-{epoch:02d}-{val_loss:.4f}"
+    - class_path: EarlyStopping
+      init_args:
+        monitor: val/loss
+        patience: 15
+        mode: min
+  max_epochs: 150
+  log_every_n_steps: 5
+  default_root_dir: output/pln_land_use/
+
+data:
+  class_path: terratorch.datamodules.GenericMultiModalDataModule
+  init_args:
+    task: 'segmentation'
+    batch_size: 8
+    num_workers: 4
+    modalities:
+      - S2L2A
+    rgb_modality: S2L2A
+    rgb_indices:
+      - 3
+      - 2
+      - 1
+
+    # PLN-specific data paths (replace with your data)
+    train_data_root:
+      S2L2A: data/pln_lulc/train/S2L2A
+    train_label_data_root: data/pln_lulc/train/labels
+    val_data_root:
+      S2L2A: data/pln_lulc/val/S2L2A
+    val_label_data_root: data/pln_lulc/val/labels
+    test_data_root:
+      S2L2A: data/pln_lulc/test/S2L2A
+    test_label_data_root: data/pln_lulc/test/labels
+
+    image_grep:
+      S2L2A: "*.tif"
+    label_grep: "*.tif"
+
+    no_label_replace: -1
+    no_data_replace: 0
+    num_classes: 10
+
+    # TerraMind standardization values
+    means:
+      S2L2A: [1390.458, 1503.317, 1718.197, 1853.910, 2199.100, 2779.975, 2987.011, 3083.234, 3132.220, 3162.988, 2424.884, 1857.648]
+    stds:
+      S2L2A: [2106.761, 2141.107, 2038.973, 2134.138, 2085.321, 1889.926, 1820.257, 1871.918, 1753.829, 1797.379, 1434.261, 1334.311]
+
+    train_transform:
+      - class_path: albumentations.D4
+      - class_path: ToTensorV2
+
+model:
+  class_path: terratorch.tasks.SemanticSegmentationTask
+  init_args:
+    model_factory: EncoderDecoderFactory
+    model_args:
+      backbone: terramind_v1_base_tim
+      backbone_pretrained: true
+      backbone_modalities:
+        - S2L2A
+      backbone_tim_modalities:
+        - LULC
+      backbone_merge_method: mean
+
+      necks:
+        - name: SelectIndices
+          indices: [2, 5, 8, 11]  # base version
+        - name: ReshapeTokensToImage
+          remove_cls_token: False
+        - name: LearnedInterpolateToPyramidal
+
+      decoder: UNetDecoder
+      decoder_channels: [512, 256, 128, 64]
+
+      head_dropout: 0.1
+      num_classes: 10
+    loss: ce
+    ignore_index: -1
+    freeze_backbone: false
+    freeze_decoder: false
+    class_names:
+      - No_Data
+      - Water
+      - Trees
+      - Grass
+      - Flooded_Vegetation
+      - Crops
+      - Scrub_Shrub
+      - Built_Area
+      - Bare_Ground
+      - Snow_Ice
+
+optimizer:
+  class_path: torch.optim.AdamW
+  init_args:
+    lr: 2.e-5
+lr_scheduler:
+  class_path: ReduceLROnPlateau
+  init_args:
+    monitor: val/loss
+    factor: 0.5
+    patience: 5
