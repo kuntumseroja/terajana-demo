@@ -1,0 +1,83 @@
+name: Deploy to Hugging Face Spaces
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'pln_demo/**'
+      - 'demo_data/**'
+      - 'configs/**'
+      - 'examples/**'
+      - 'deploy/hf-spaces/**'
+      - 'requirements.txt'
+  workflow_dispatch:  # allow manual trigger from GitHub Actions tab
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout GitHub repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          lfs: true
+
+      - name: Setup deployment files
+        run: |
+          # Create a staging directory with the HF Space structure
+          mkdir -p /tmp/hf-deploy/.streamlit
+
+          # Copy HF Space config files (Dockerfile, README, requirements)
+          cp deploy/hf-spaces/Dockerfile /tmp/hf-deploy/
+          cp deploy/hf-spaces/requirements.txt /tmp/hf-deploy/
+          cp deploy/hf-spaces/README.md /tmp/hf-deploy/
+          cp deploy/hf-spaces/.streamlit/config.toml /tmp/hf-deploy/.streamlit/
+
+          # Copy application code
+          cp -r pln_demo /tmp/hf-deploy/
+          rm -rf /tmp/hf-deploy/pln_demo/__pycache__
+          rm -rf /tmp/hf-deploy/pln_demo/demo_output
+          rm -rf /tmp/hf-deploy/pln_demo/output
+
+          # Copy satellite data
+          mkdir -p /tmp/hf-deploy/demo_data/indonesia
+          cp demo_data/indonesia/*.tif /tmp/hf-deploy/demo_data/indonesia/
+
+          # Copy config files
+          mkdir -p /tmp/hf-deploy/configs
+          cp configs/pln_*.yaml /tmp/hf-deploy/configs/ 2>/dev/null || true
+
+          # Copy examples
+          if [ -d "examples" ]; then
+            cp -r examples /tmp/hf-deploy/
+          fi
+
+          # Create notebooks dir (referenced by code)
+          mkdir -p /tmp/hf-deploy/notebooks
+
+          echo "=== Deployment staging ready ==="
+          find /tmp/hf-deploy -type f | grep -v ".git/" | wc -l | xargs echo "Total files:"
+
+      - name: Push to Hugging Face Spaces
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          pip install huggingface_hub
+
+          python - <<'PYEOF'
+          import os
+          from huggingface_hub import HfApi
+
+          api = HfApi(token=os.environ["HF_TOKEN"])
+
+          api.upload_folder(
+              folder_path="/tmp/hf-deploy",
+              repo_id="terancammuda/terajana-demo",
+              repo_type="space",
+              commit_message=f"Auto-deploy from GitHub (commit: {os.environ.get('GITHUB_SHA', 'unknown')[:8]})",
+              delete_patterns=["*"],  # clean old files before uploading
+          )
+          print("Deployed to https://huggingface.co/spaces/terancammuda/terajana-demo")
+          PYEOF
