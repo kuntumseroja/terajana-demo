@@ -39,6 +39,83 @@ from pln_demo.pln_analysis import (
 )
 
 # ---------------------------------------------------------------------------
+# API Server Mode Support
+# ---------------------------------------------------------------------------
+# When TERRAMIND_API_URL is set, the dashboard calls the local API server
+# instead of loading the model in-process. This decouples the UI from the
+# model and allows multiple dashboards to share one model server.
+#
+# Set via environment variable or sidebar toggle:
+#   export TERRAMIND_API_URL=http://localhost:8786
+# ---------------------------------------------------------------------------
+TERRAMIND_API_URL = os.environ.get("TERRAMIND_API_URL", "")
+
+
+class APIAnalyzerWrapper:
+    """Wraps TerraMindClient to match PLNTerraMindAnalyzer interface for app.py."""
+
+    def __init__(self, api_url: str):
+        from pln_demo.terramind_client import TerraMindClient
+        self.client = TerraMindClient(api_url)
+        self.api_url = api_url
+        info = self.client.health()
+        self.device = info.get("device", "remote")
+        self.model_size = info.get("model", "api")
+
+    def _tensor_to_geotiff_b64(self, tensor):
+        """Save tensor to temp GeoTIFF and return path."""
+        import tempfile, rasterio
+        from rasterio.transform import from_bounds
+
+        data = tensor.cpu().numpy()
+        if data.ndim == 4:
+            data = data[0]  # remove batch dim -> (C, H, W)
+
+        with tempfile.NamedTemporaryFile(suffix=".tif", delete=False) as tmp:
+            tmp_path = tmp.name
+
+        with rasterio.open(
+            tmp_path, "w", driver="GTiff",
+            height=data.shape[1], width=data.shape[2], count=data.shape[0],
+            dtype=data.dtype,
+        ) as dst:
+            dst.write(data)
+
+        return tmp_path
+
+    def generate(self, input_tensor, input_modality="S2L2A", output_modalities=None, verbose=None):
+        if output_modalities is None:
+            output_modalities = ["S1GRD", "DEM", "LULC"]
+        tmp_path = self._tensor_to_geotiff_b64(input_tensor)
+        try:
+            result = self.client.generate(tmp_path, output_modalities=output_modalities, return_images=False)
+        finally:
+            os.unlink(tmp_path)
+        # The API returns tensor metadata but not raw tensors in non-image mode
+        # For full compatibility, we need the dashboard to use analyze endpoints
+        return result
+
+    def analyze_vegetation_risk(self, input_tensor):
+        return self._call_analyze(input_tensor, "vegetation")
+
+    def analyze_flood_risk(self, input_tensor):
+        return self._call_analyze(input_tensor, "flood")
+
+    def analyze_land_use(self, input_tensor):
+        return self._call_analyze(input_tensor, "land_use")
+
+    def full_site_survey(self, input_tensor):
+        return self._call_analyze(input_tensor, "full_survey")
+
+    def _call_analyze(self, input_tensor, analysis_type):
+        tmp_path = self._tensor_to_geotiff_b64(input_tensor)
+        try:
+            result = self.client.analyze(tmp_path, analysis_type=analysis_type, return_pil=True)
+        finally:
+            os.unlink(tmp_path)
+        return result
+
+# ---------------------------------------------------------------------------
 # Page Config
 # ---------------------------------------------------------------------------
 st.set_page_config(
@@ -311,14 +388,37 @@ def render_sidebar():
             st.session_state.results = {}
             os.unlink(tmp_path)
 
-    # Initialize model
-    if st.sidebar.button("Initialize Model", use_container_width=True):
-        with st.spinner(f"Loading terramind_v1_{model_size}_generate..."):
-            st.session_state.analyzer = PLNTerraMindAnalyzer(
-                model_size=model_size,
-                timesteps=timesteps,
-            )
-        st.sidebar.success("Model loaded!")
+    # Model initialization — either local or via API server
+    st.sidebar.markdown("### Model Loading")
+    api_url = TERRAMIND_API_URL
+    use_api = st.sidebar.checkbox(
+        "Use API Server",
+        value=bool(api_url),
+        help="Connect to a running TerraMind server instead of loading model in-process.",
+    )
+    if use_api:
+        api_url = st.sidebar.text_input(
+            "Server URL",
+            value=api_url or "http://localhost:8786",
+        )
+        if st.sidebar.button("Connect to Server", use_container_width=True):
+            with st.spinner(f"Connecting to {api_url}..."):
+                try:
+                    wrapper = APIAnalyzerWrapper(api_url)
+                    st.session_state.analyzer = wrapper
+                    st.session_state.api_mode = True
+                    st.sidebar.success(f"Connected! Device: {wrapper.device}")
+                except Exception as e:
+                    st.sidebar.error(f"Connection failed: {e}")
+    else:
+        if st.sidebar.button("Initialize Model (Local)", use_container_width=True):
+            with st.spinner(f"Loading terramind_v1_{model_size}_generate..."):
+                st.session_state.analyzer = PLNTerraMindAnalyzer(
+                    model_size=model_size,
+                    timesteps=timesteps,
+                )
+                st.session_state.api_mode = False
+            st.sidebar.success("Model loaded!")
 
     st.sidebar.markdown("---")
     st.sidebar.markdown("### PLN Infrastructure")
@@ -556,6 +656,8 @@ def render_analysis():
         ],
     )
 
+    is_api = st.session_state.get("api_mode", False)
+
     if st.button("Run Analysis", type="primary", use_container_width=True):
         progress = st.progress(0, text="Initializing...")
 
@@ -565,7 +667,10 @@ def render_analysis():
             st.session_state.results["vegetation"] = result
             progress.progress(100, text="Complete!")
 
-            render_vegetation_results(input_tensor, result)
+            if is_api:
+                render_api_results(input_tensor, result, "vegetation")
+            else:
+                render_vegetation_results(input_tensor, result)
 
         elif analysis_type == "Flood Risk Assessment":
             progress.progress(10, text="Generating SAR and DEM...")
@@ -573,7 +678,10 @@ def render_analysis():
             st.session_state.results["flood"] = result
             progress.progress(100, text="Complete!")
 
-            render_flood_results(input_tensor, result)
+            if is_api:
+                render_api_results(input_tensor, result, "flood")
+            else:
+                render_flood_results(input_tensor, result)
 
         elif analysis_type == "Land Use Change Monitoring":
             progress.progress(10, text="Generating LULC...")
@@ -581,7 +689,10 @@ def render_analysis():
             st.session_state.results["land_use"] = result
             progress.progress(100, text="Complete!")
 
-            render_land_use_results(input_tensor, result)
+            if is_api:
+                render_api_results(input_tensor, result, "land_use")
+            else:
+                render_land_use_results(input_tensor, result)
 
         elif analysis_type == "Full Multi-Modal Site Survey":
             progress.progress(10, text="Generating SAR, DEM, LULC, NDVI...")
@@ -589,7 +700,10 @@ def render_analysis():
             st.session_state.results["survey"] = result
             progress.progress(100, text="Complete!")
 
-            render_survey_results(input_tensor, result)
+            if is_api:
+                render_api_results(input_tensor, result, "full_survey")
+            else:
+                render_survey_results(input_tensor, result)
 
 
 def render_vegetation_results(input_tensor, result):
@@ -759,6 +873,70 @@ def render_survey_results(input_tensor, result):
         )
         ax2.set_title("Distribution")
 
+        plt.tight_layout()
+        st.pyplot(fig)
+        plt.close(fig)
+
+
+def render_api_results(input_tensor, result, analysis_type):
+    """Render results returned from the TerraMind API server.
+
+    API results contain:
+      - result["statistics"]: dict of stats (same structure as local)
+      - result["images"]: dict of PIL Images keyed by modality name
+      - result["inference_time_s"]: float
+    """
+    stats = result.get("statistics", {})
+    images = result.get("images", {})
+    inf_time = result.get("inference_time_s", 0)
+
+    st.markdown(f"#### Analysis Results  *(API mode, {inf_time:.1f}s)*")
+
+    # Show statistics as metrics
+    if analysis_type == "vegetation":
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("NDVI Mean", f"{stats.get('ndvi_mean', 0):.3f}")
+        c2.metric("High Vegetation %", f"{stats.get('high_vegetation_pct', 0):.1f}%")
+        c3.metric("High Risk Area", f"{stats.get('high_risk_pct', 0):.1f}%")
+        c4.metric("Critical Risk Area", f"{stats.get('critical_risk_pct', 0):.1f}%")
+
+    elif analysis_type == "flood":
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Elevation Min", f"{stats.get('dem_min_m', 0):.0f} m")
+        c2.metric("Elevation Max", f"{stats.get('dem_max_m', 0):.0f} m")
+        c3.metric("Low Elevation %", f"{stats.get('low_elevation_pct', 0):.1f}%")
+        c4.metric("High Flood Risk %", f"{stats.get('high_flood_risk_pct', 0):.1f}%")
+
+    elif analysis_type == "land_use":
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Built Area", f"{stats.get('built_area_pct', 0):.1f}%")
+        c2.metric("Forest Coverage", f"{stats.get('forest_pct', 0):.1f}%")
+        c3.metric("Agriculture", f"{stats.get('agriculture_pct', 0):.1f}%")
+
+    elif analysis_type == "full_survey":
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("NDVI Mean", f"{stats.get('ndvi_mean', 0):.3f}")
+        c2.metric("Elevation Range", str(stats.get("dem_range_m", "N/A")) + " m")
+        c3.metric("Vegetation %", f"{stats.get('vegetation_coverage_pct', 0):.1f}%")
+        c4.metric("Built Area %", f"{stats.get('built_area_pct', 0):.1f}%")
+
+    # Show images from API (already PIL Images)
+    if images:
+        cols = st.columns(len(images))
+        for col, (name, pil_img) in zip(cols, images.items()):
+            with col:
+                caption = name.upper().replace("_", " ")
+                st.image(pil_img, caption=caption, use_container_width=True)
+
+    # LULC distribution chart
+    lulc_dist = stats.get("lulc_distribution", {})
+    if lulc_dist:
+        st.markdown("#### Land Cover Distribution")
+        import matplotlib.pyplot as plt
+        fig, ax = plt.subplots(figsize=(8, 3))
+        ax.barh(list(lulc_dist.keys()), list(lulc_dist.values()), color="#2e86c1")
+        ax.set_xlabel("Coverage (%)")
+        ax.set_title("Land Cover Classes")
         plt.tight_layout()
         st.pyplot(fig)
         plt.close(fig)
